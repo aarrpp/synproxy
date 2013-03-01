@@ -20,4 +20,5 @@ with it. For example, you want to protect the local HTTP server from the
 SYN-flood attacks:
 	iptables -t nat -A OUTPUT -p tcp --dport 80 -d XXX.XXX.XXX.XXX -j DNAT --to-destination XXX.XXX.XXX.XXX:80
 	iptables -t raw -A PREROUTING -p tcp -d XXX.XXX.XXX.XXX --dport 80 --tcp-flags SYN,ACK,RST,FIN SYN -j SYNPROXY
+	
 
