@@ -1,0 +1,238 @@
+diff --git a/include/net/netfilter/nf_conntrack.h b/include/net/netfilter/nf_conntrack.h
+index bde095f..1046633 100644
+--- a/include/net/netfilter/nf_conntrack.h
++++ b/include/net/netfilter/nf_conntrack.h
+@@ -17,6 +17,7 @@
+ #ifdef __KERNEL__
+ #include <linux/bitops.h>
+ #include <linux/compiler.h>
++#include <linux/tcp.h>
+ #include <asm/atomic.h>
+ 
+ #include <linux/netfilter/nf_conntrack_tcp.h>
+@@ -310,5 +311,10 @@ do {							\
+ #define MODULE_ALIAS_NFCT_HELPER(helper) \
+         MODULE_ALIAS("nfct-helper-" helper)
+ 
++extern int (*syn_proxy_pre_hook)(struct sk_buff *skb, struct nf_conn *ct,
++				 struct tcphdr *th);
++
++extern int (*syn_proxy_post_hook)(struct sk_buff *skb, struct nf_conn *ct,
++				  enum ip_conntrack_info ctinfo);
+ #endif /* __KERNEL__ */
+ #endif /* _NF_CONNTRACK_H */
+diff --git a/include/net/netfilter/nf_conntrack_core.h b/include/net/netfilter/nf_conntrack_core.h
+index dffde8e..e9b739e 100644
+--- a/include/net/netfilter/nf_conntrack_core.h
++++ b/include/net/netfilter/nf_conntrack_core.h
+@@ -63,8 +63,15 @@ static inline int nf_conntrack_confirm(struct sk_buff *skb)
+ 	if (ct && ct != &nf_conntrack_untracked) {
+ 		if (!nf_ct_is_confirmed(ct) && !nf_ct_is_dying(ct))
+ 			ret = __nf_conntrack_confirm(skb);
+-		if (likely(ret == NF_ACCEPT))
++		if (likely(ret == NF_ACCEPT)) {
++			int (*syn_proxy)(struct sk_buff *, struct nf_conn *,
++					 enum ip_conntrack_info);
++
+ 			nf_ct_deliver_cached_events(ct);
++			syn_proxy = rcu_dereference(syn_proxy_post_hook);
++			if (syn_proxy)
++				ret = syn_proxy(skb, ct, skb->nfctinfo);
++		}
+ 	}
+ 	return ret;
+ }
+diff --git a/include/net/netfilter/nf_conntrack_extend.h b/include/net/netfilter/nf_conntrack_extend.h
+index 32d15bd..b2ae7e9 100644
+--- a/include/net/netfilter/nf_conntrack_extend.h
++++ b/include/net/netfilter/nf_conntrack_extend.h
+@@ -11,6 +11,7 @@ enum nf_ct_ext_id {
+ 	NF_CT_EXT_ACCT,
+ 	NF_CT_EXT_ECACHE,
+ 	NF_CT_EXT_ZONE,
++	NF_CT_EXT_SYNPROXY,
+ 	NF_CT_EXT_NUM,
+ };
+ 
+@@ -19,6 +20,7 @@ enum nf_ct_ext_id {
+ #define NF_CT_EXT_ACCT_TYPE struct nf_conn_counter
+ #define NF_CT_EXT_ECACHE_TYPE struct nf_conntrack_ecache
+ #define NF_CT_EXT_ZONE_TYPE struct nf_conntrack_zone
++#define NF_CT_EXT_SYNPROXY_TYPE struct syn_proxy_state
+ 
+ /* Extensions: optional stuff which isn't permanently in struct. */
+ struct nf_ct_ext {
+diff --git a/include/net/tcp.h b/include/net/tcp.h
+index a144914..b1d59c2 100644
+--- a/include/net/tcp.h
++++ b/include/net/tcp.h
+@@ -460,8 +460,18 @@ extern int			tcp_disconnect(struct sock *sk, int flags);
+ extern __u32 syncookie_secret[2][16-4+SHA_DIGEST_WORDS];
+ extern struct sock *cookie_v4_check(struct sock *sk, struct sk_buff *skb, 
+ 				    struct ip_options *opt);
+-extern __u32 cookie_v4_init_sequence(struct sock *sk, struct sk_buff *skb, 
+-				     __u16 *mss);
++extern __u32 __cookie_v4_init_sequence(__be32 saddr, __be32 daddr,
++				       __be16 sport, __be16 dport, __u32 seq,
++				       __u16 *mssp);
++static inline __u32 cookie_v4_init_sequence(const struct iphdr *iph,
++					    const struct tcphdr *th,
++					    __u16 *mssp)
++{
++	return __cookie_v4_init_sequence(iph->saddr, iph->daddr, th->source,
++					 th->dest, ntohl(th->seq), mssp);
++}
++extern int cookie_v4_check_sequence(const struct iphdr *iph,
++				    const struct tcphdr *th, __u32 cookie);
+ 
+ extern __u32 cookie_init_timestamp(struct request_sock *req);
+ extern void cookie_check_timestamp(struct tcp_options_received *tcp_opt);
+diff --git a/net/ipv4/syncookies.c b/net/ipv4/syncookies.c
+index 5c24db4..d61d374 100644
+--- a/net/ipv4/syncookies.c
++++ b/net/ipv4/syncookies.c
+@@ -160,26 +160,22 @@ static __u16 const msstab[] = {
+  * Generate a syncookie.  mssp points to the mss, which is returned
+  * rounded down to the value encoded in the cookie.
+  */
+-__u32 cookie_v4_init_sequence(struct sock *sk, struct sk_buff *skb, __u16 *mssp)
++__u32 __cookie_v4_init_sequence(__be32 saddr, __be32 daddr, __be16 sport,
++				__be16 dport, __u32 seq, __u16 *mssp)
+ {
+-	const struct iphdr *iph = ip_hdr(skb);
+-	const struct tcphdr *th = tcp_hdr(skb);
+ 	int mssind;
+ 	const __u16 mss = *mssp;
+ 
+-	tcp_synq_overflow(sk);
+-
+ 	/* XXX sort msstab[] by probability?  Binary search? */
+ 	for (mssind = 0; mss > msstab[mssind + 1]; mssind++)
+ 		;
+ 	*mssp = msstab[mssind] + 1;
+ 
+-	NET_INC_STATS_BH(sock_net(sk), LINUX_MIB_SYNCOOKIESSENT);
+ 
+-	return secure_tcp_syn_cookie(iph->saddr, iph->daddr,
+-				     th->source, th->dest, ntohl(th->seq),
++	return secure_tcp_syn_cookie(saddr, daddr, sport, dport, seq,
+ 				     jiffies / (HZ * 60), mssind);
+ }
++EXPORT_SYMBOL(__cookie_v4_init_sequence);
+ 
+ /*
+  * This (misnamed) value is the age of syncookie which is permitted.
+@@ -192,10 +188,9 @@ __u32 cookie_v4_init_sequence(struct sock *sk, struct sk_buff *skb, __u16 *mssp)
+  * Check if a ack sequence number is a valid syncookie.
+  * Return the decoded mss if it is, or 0 if not.
+  */
+-static inline int cookie_check(struct sk_buff *skb, __u32 cookie)
++int cookie_v4_check_sequence(const struct iphdr *iph, const struct tcphdr *th,
++			     __u32 cookie)
+ {
+-	const struct iphdr *iph = ip_hdr(skb);
+-	const struct tcphdr *th = tcp_hdr(skb);
+ 	__u32 seq = ntohl(th->seq) - 1;
+ 	__u32 mssind = check_tcp_syn_cookie(cookie, iph->saddr, iph->daddr,
+ 					    th->source, th->dest, seq,
+@@ -204,6 +199,7 @@ static inline int cookie_check(struct sk_buff *skb, __u32 cookie)
+ 
+ 	return mssind < NUM_MSS ? msstab[mssind] + 1 : 0;
+ }
++EXPORT_SYMBOL(cookie_v4_check_sequence);
+ 
+ static inline struct sock *get_cookie_sock(struct sock *sk, struct sk_buff *skb,
+ 					   struct request_sock *req,
+@@ -270,7 +266,8 @@ struct sock *cookie_v4_check(struct sock *sk, struct sk_buff *skb,
+ 		goto out;
+ 
+ 	if (tcp_synq_no_recent_overflow(sk) ||
+-	    (mss = cookie_check(skb, cookie)) == 0) {
++	    (mss = cookie_v4_check_sequence(ip_hdr(skb), tcp_hdr(skb),
++					    cookie)) == 0) {
+ 		NET_INC_STATS_BH(sock_net(sk), LINUX_MIB_SYNCOOKIESFAILED);
+ 		goto out;
+ 	}
+diff --git a/net/ipv4/tcp_ipv4.c b/net/ipv4/tcp_ipv4.c
+index 202cf09..9879c3b 100644
+--- a/net/ipv4/tcp_ipv4.c
++++ b/net/ipv4/tcp_ipv4.c
+@@ -1330,8 +1330,11 @@ int tcp_v4_conn_request(struct sock *sk, struct sk_buff *skb)
+ #ifdef CONFIG_SYN_COOKIES
+ 		syn_flood_warning(skb);
+ 		req->cookie_ts = tmp_opt.tstamp_ok;
++		tcp_synq_overflow(sk);
++		NET_INC_STATS_BH(sock_net(sk), LINUX_MIB_SYNCOOKIESSENT);
++		isn = cookie_v4_init_sequence(ip_hdr(skb), tcp_hdr(skb),
++					      &req->mss);
+ #endif
+-		isn = cookie_v4_init_sequence(sk, skb, &req->mss);
+ 	} else if (!isn) {
+ 		struct inet_peer *peer = NULL;
+ 
+diff --git a/net/netfilter/nf_conntrack_core.c b/net/netfilter/nf_conntrack_core.c
+index b83c530..7a4b0e0 100644
+--- a/net/netfilter/nf_conntrack_core.c
++++ b/net/netfilter/nf_conntrack_core.c
+@@ -847,8 +847,19 @@ nf_conntrack_in(struct net *net, u_int8_t pf, unsigned int hooknum,
+ 			       l3proto, l4proto, &set_reply, &ctinfo);
+ 	if (!ct) {
+ 		/* Not valid part of a connection */
+-		NF_CT_STAT_INC_ATOMIC(net, invalid);
++		int (*syn_proxy)(struct sk_buff *, struct nf_conn *,
++				 struct tcphdr *);
++
++		if (protonum == IPPROTO_TCP &&
++		    (syn_proxy = rcu_dereference(syn_proxy_pre_hook))) {
++			struct tcphdr *th, _th;
++
++			th = skb_header_pointer(skb, dataoff, sizeof(_th), &th);
++			BUG_ON(th == NULL);
++			ret = syn_proxy(skb, NULL, th);
++		} else
+ 		ret = NF_ACCEPT;
++		NF_CT_STAT_INC_ATOMIC(net, invalid);
+ 		goto out;
+ 	}
+ 
+@@ -1448,6 +1459,14 @@ s16 (*nf_ct_nat_offset)(const struct nf_conn *ct,
+ 			u32 seq);
+ EXPORT_SYMBOL_GPL(nf_ct_nat_offset);
+ 
++int (*syn_proxy_pre_hook)(struct sk_buff *skb, struct nf_conn *ct,
++			  struct tcphdr *th) = NULL;
++EXPORT_SYMBOL(syn_proxy_pre_hook);
++
++int (*syn_proxy_post_hook)(struct sk_buff *skb, struct nf_conn *ct,
++			   enum ip_conntrack_info ctinfo) = NULL;
++EXPORT_SYMBOL(syn_proxy_post_hook);
++
+ int nf_conntrack_init(struct net *net)
+ {
+ 	int ret;
+diff --git a/net/netfilter/nf_conntrack_proto_tcp.c b/net/netfilter/nf_conntrack_proto_tcp.c
+index 9dd8cd4..358c06b 100644
+--- a/net/netfilter/nf_conntrack_proto_tcp.c
++++ b/net/netfilter/nf_conntrack_proto_tcp.c
+@@ -830,10 +830,21 @@ static int tcp_packet(struct nf_conn *ct,
+ 	struct tcphdr _tcph;
+ 	unsigned long timeout;
+ 	unsigned int index;
++	int (*syn_proxy)(struct sk_buff *, struct nf_conn *,
++			 struct tcphdr *);
+ 
+ 	th = skb_header_pointer(skb, dataoff, sizeof(_tcph), &_tcph);
+ 	BUG_ON(th == NULL);
+ 
++	syn_proxy = rcu_dereference(syn_proxy_pre_hook);
++	if (syn_proxy) {
++		int ret = syn_proxy((struct sk_buff*)skb, ct,
++				    (struct tcphdr *)th);
++
++		if (ret != NF_ACCEPT)
++			return ret;
++	}
++
+ 	spin_lock_bh(&ct->lock);
+ 	old_state = ct->proto.tcp.state;
+ 	dir = CTINFO2DIR(ctinfo);

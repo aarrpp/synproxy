@@ -1,0 +1,12 @@
+0. test if synproxy works with bridge, fireware(SNAT, DNAT).
+1. support timeout parameter:
+   1.1 initial window size should be mss.
+   1.2 relay connection when timeouts.
+   1.3 ACK server with data, NF_STOLEN packet for later acking, reuse.
+   1.4 timeout is only supported when MSS exists.
+2. synproxy matcher.
+   2.1 match data, such as http-url.
+   2.2 then it can work with NAT. defer SNAT or DNAT.
+3. stateful synproxy.
+4. zero copy, skb_recycle_check(), NF_STOLEN.
+5. don't always use ip_local_out().
