@@ -4,10 +4,11 @@ else
 KERNELDIR ?= /lib/modules/$(shell uname -r)/build
 PWD := $(shell pwd)
 
-all: ipt_SYNPROXY.ko libipt_SYNPROXY.so
+#all: ipt_SYNPROXY.ko libipt_SYNPROXY.so
+all: libipt_SYNPROXY.so
 
-ipt_SYNPROXY.ko: ipt_SYNPROXY.c
-	$(MAKE) -C $(KERNELDIR) M=$(PWD) modules
+#ipt_SYNPROXY.ko: ipt_SYNPROXY.c
+#	$(MAKE) -C $(KERNELDIR) M=$(PWD) modules
 
 libipt_SYNPROXY.so: libipt_SYNPROXY.c
 	$(CC) -Wall -fPIC -shared -o $@ $^
